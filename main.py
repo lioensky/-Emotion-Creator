@@ -2,9 +2,9 @@ import sys
 import os
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QFileDialog, QLabel, QSpinBox, QScrollArea, 
-                             QLineEdit, QGridLayout, QMessageBox, QFrame)
-from PyQt6.QtGui import QPixmap, QImage, QPainter, QPen, QColor, QCursor
-from PyQt6.QtCore import Qt, QRect, pyqtSignal, QPoint
+                             QLineEdit, QGridLayout, QMessageBox, QFrame, QPlainTextEdit)
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor
+from PyQt6.QtCore import Qt, QRect, pyqtSignal, QSignalBlocker
 from PIL import Image
 
 class ImageLabel(QLabel):
@@ -15,6 +15,7 @@ class ImageLabel(QLabel):
         self.rows = 4
         self.cols = 4
         self.pixmap_orig = None
+        self.slice_names = []
         self.row_offsets = [] # Normalized offsets (0.0 to 1.0)
         self.col_offsets = []
         self.dragging_line = None # ('row', index) or ('col', index)
@@ -35,6 +36,41 @@ class ImageLabel(QLabel):
         self.reset_offsets()
         self.update_display()
 
+    def set_slice_names(self, names):
+        self.slice_names = names
+        self.update_display()
+
+    def draw_slice_names(self, painter, width, height):
+        font = painter.font()
+        font.setBold(True)
+        for idx, name in enumerate(self.slice_names[:self.rows * self.cols]):
+            if not name:
+                continue
+            row, col = divmod(idx, self.cols)
+            left = int(width * self.col_offsets[col])
+            right = int(width * self.col_offsets[col + 1])
+            top = int(height * self.row_offsets[row])
+            bottom = int(height * self.row_offsets[row + 1])
+            cell_width, cell_height = right - left, bottom - top
+            if cell_width < 16 or cell_height < 20:
+                continue
+
+            font.setPixelSize(min(32, max(10, min(cell_width, cell_height) // 7)))
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            text = metrics.elidedText(name, Qt.TextElideMode.ElideRight, cell_width - 12)
+            if not text:
+                continue
+            badge_width = metrics.horizontalAdvance(text) + 8
+            badge_height = metrics.height() + 4
+            if badge_height + 4 > cell_height:
+                continue
+            badge = QRect(left + (cell_width - badge_width) // 2,
+                          bottom - badge_height - 2, badge_width, badge_height)
+            painter.fillRect(badge, QColor(0, 0, 0, 180))
+            painter.setPen(Qt.GlobalColor.white)
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, text)
+
     def update_display(self):
         if self.pixmap_orig:
             temp_pixmap = self.pixmap_orig.copy()
@@ -53,7 +89,8 @@ class ImageLabel(QLabel):
             for x_offset in self.col_offsets[1:-1]:
                 x = int(w * x_offset)
                 painter.drawLine(x, 0, x, h)
-            
+
+            self.draw_slice_names(painter, w, h)
             painter.end()
             self.setPixmap(temp_pixmap)
 
@@ -191,6 +228,31 @@ class EmotionCreator(QMainWindow):
         grid_ctrl_layout.addWidget(self.spin_cols)
         right_layout.addLayout(grid_ctrl_layout)
 
+        # Unified Prefix
+        prefix_layout = QHBoxLayout()
+        prefix_layout.addWidget(QLabel("统一文件名开头:"))
+        self.edit_prefix = QLineEdit()
+        self.edit_prefix.setPlaceholderText("例如: MyEmoji_")
+        prefix_layout.addWidget(self.edit_prefix)
+        right_layout.addLayout(prefix_layout)
+
+        right_layout.addWidget(QLabel("批量命名（每行一排，用 | 分隔）"))
+        self.batch_names = QPlainTextEdit()
+        self.batch_names.setPlaceholderText("开心|失望|生气\n哭了|爱你|比心\n喜欢|难受|伤心")
+        self.batch_names.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.batch_names.setTabChangesFocus(True)
+        self.batch_names.setFixedHeight(100)
+        right_layout.addWidget(self.batch_names)
+
+        batch_actions = QHBoxLayout()
+        btn_parse_names = QPushButton("解析并填入")
+        btn_parse_names.clicked.connect(self.parse_batch_names)
+        batch_actions.addWidget(btn_parse_names)
+        btn_copy_prompt = QPushButton("复制 AI 提示词")
+        btn_copy_prompt.clicked.connect(self.copy_ai_prompt)
+        batch_actions.addWidget(btn_copy_prompt)
+        right_layout.addLayout(batch_actions)
+
         # Naming Area
         right_layout.addWidget(QLabel("切片命名 (按顺序):"))
         self.name_scroll = QScrollArea()
@@ -245,6 +307,62 @@ class EmotionCreator(QMainWindow):
                 self.name_grid.addWidget(QLabel(f"{r+1}-{c+1}:"), idx, 0)
                 self.name_grid.addWidget(edit, idx, 1)
                 self.name_inputs.append(edit)
+                edit.textChanged.connect(self.update_preview_names)
+
+        self.update_preview_names()
+
+    def update_preview_names(self):
+        self.image_label.set_slice_names([edit.text().strip() for edit in self.name_inputs])
+
+    def parse_batch_names(self):
+        try:
+            names = self.parse_name_grid(self.batch_names.toPlainText())
+        except ValueError as error:
+            QMessageBox.warning(self, "无法解析名称", str(error))
+            return
+
+        for edit, name in zip(self.name_inputs, names):
+            with QSignalBlocker(edit):
+                edit.setText(name)
+        self.update_preview_names()
+        self.statusBar().showMessage(f"已填入 {len(names)} 个表情包名称", 4000)
+
+    def parse_name_grid(self, text):
+        lines = text.strip().splitlines()
+        if len(lines) != self.rows:
+            raise ValueError(f"当前网格需要 {self.rows} 行，实际收到 {len(lines)} 行。")
+
+        names = []
+        seen = set()
+        for row, line in enumerate(lines, start=1):
+            cells = line.replace("｜", "|").split("|")
+            if len(cells) != self.cols:
+                raise ValueError(f"第 {row} 行需要 {self.cols} 列，实际收到 {len(cells)} 列。")
+            for col, cell in enumerate(cells, start=1):
+                name = cell.strip()
+                location = f"第 {row} 行第 {col} 列"
+                if not name:
+                    raise ValueError(f"{location}的名称不能为空。")
+                if name in {".", ".."} or any(ch in '<>:"/\\?*' or ord(ch) < 32 for ch in name):
+                    raise ValueError(f"{location}的名称含有不能用于文件名的字符。")
+                key = name.casefold()
+                if key in seen:
+                    raise ValueError(f"{location}的名称「{name}」重复，导出时可能覆盖其他切片。")
+                seen.add(key)
+                names.append(name)
+        return names
+
+    def copy_ai_prompt(self):
+        prompt = (
+            f"请分析我上传的表情包图片。它是 {self.rows} 行、{self.cols} 列的宫格，"
+            "请根据每一格的表情、动作或文字，为它起一个简短且互不重复的中文名称。\n"
+            f"按从上到下、每行从左到右的顺序，输出正好 {self.rows} 行，"
+            f"每行正好 {self.cols} 个名称，使用半角竖线 | 分隔同一行的名称。\n"
+            "只输出可直接粘贴的纯文本，不要标题、序号、解释、代码块、空行或首尾分隔符。"
+            "名称不要包含文件扩展名或文件名禁用字符。"
+        )
+        QApplication.clipboard().setText(prompt)
+        self.statusBar().showMessage("AI 提示词已复制到剪贴板", 4000)
 
     def export_images(self):
         if not self.image_path:
@@ -261,18 +379,23 @@ class EmotionCreator(QMainWindow):
             row_px = [int(h * height) for h in self.image_label.row_offsets]
             col_px = [int(w * width) for w in self.image_label.col_offsets]
 
+            prefix = self.edit_prefix.text().strip()
             for r in range(self.rows):
                 for c in range(self.cols):
                     idx = r * self.cols + c
                     name = self.name_inputs[idx].text().strip()
-                    if not name: name = f"slice_{r+1}_{c+1}"
+
+                    if not name:
+                        final_name = f"{prefix}slice_{r+1}_{c+1}"
+                    else:
+                        final_name = f"{prefix}{name}"
                     
                     left, top = col_px[c], row_px[r]
                     right, bottom = col_px[c+1], row_px[r+1]
 
                     crop = img.crop((left, top, right, bottom))
                     _, ext = os.path.splitext(self.image_path)
-                    save_path = os.path.join(export_dir, f"{name}{ext}")
+                    save_path = os.path.join(export_dir, f"{final_name}{ext}")
                     
                     if ext.lower() in ['.jpg', '.jpeg'] and crop.mode == 'RGBA':
                         background = Image.new("RGB", crop.size, (255, 255, 255))
